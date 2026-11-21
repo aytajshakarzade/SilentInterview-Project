@@ -1,3 +1,4 @@
+
 using System.Text;
 using System.Text.Json;
 
@@ -16,10 +17,9 @@ using SilentInterview.Infrastructure.Persistence;
 namespace SilentInterview.Infrastructure.AI;
 
 /// <summary>
-/// The AI HR assistant embedded in the recruiter dashboard. Answers free-form
-/// questions grounded strictly in the recruiter's own company's stored
-/// interview/report data — never cross-company, matching every other
-/// recruiter-scoped endpoint in the platform.
+/// The AI HR assistant embedded in the recruiter dashboard.
+/// Answers general HR questions and company-scoped interview questions.
+/// Candidate-specific answers are strictly grounded in the company's data.
 /// </summary>
 public sealed class AIAssistantService : IAIAssistantService
 {
@@ -27,7 +27,9 @@ public sealed class AIAssistantService : IAIAssistantService
     private readonly IOpenRouterService _openRouter;
     private readonly OpenRouterSettings _settings;
     private readonly ILogger<AIAssistantService> _logger;
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private static readonly JsonSerializerOptions JsonOptions =
+        new(JsonSerializerDefaults.Web);
 
     public AIAssistantService(
         SilentInterviewDbContext context,
@@ -54,36 +56,43 @@ public sealed class AIAssistantService : IAIAssistantService
 
         var language = LanguageMap.Normalize(request.Language);
 
-        // A conversation has a fixed language. Once created, every turn in that
-        // conversation must use the stored language, regardless of browser/UI locale.
+        // Keep the conversation language fixed after creation.
         if (request.ConversationId.HasValue)
         {
             var conversationLanguage = await _context.AIConversations
                 .AsNoTracking()
-                .Where(c => c.Id == request.ConversationId.Value && c.UserId == authenticatedUserId)
+                .Where(c =>
+                    c.Id == request.ConversationId.Value &&
+                    c.UserId == authenticatedUserId)
                 .Select(c => c.Language)
                 .FirstOrDefaultAsync(cancellationToken);
 
             if (!string.IsNullOrWhiteSpace(conversationLanguage))
+            {
                 language = LanguageMap.Normalize(conversationLanguage);
+            }
         }
 
         var languageName = LanguageMap.Name(language);
 
+        // Only retrieve interviews belonging to the authenticated recruiter's company.
         var sessionsQuery = _context.InterviewSessions
             .AsNoTracking()
-            .Include(s => s.JobApplication).ThenInclude(a => a.Job)
-            .Include(s => s.JobApplication).ThenInclude(a => a.Candidate).ThenInclude(c => c.User)
+            .Include(s => s.JobApplication)
+                .ThenInclude(a => a.Job)
+            .Include(s => s.JobApplication)
+                .ThenInclude(a => a.Candidate)
+                .ThenInclude(c => c.User)
             .Include(s => s.Report)
             .Where(s => s.JobApplication.Job.CompanyId == scopeCompanyId);
 
         if (request.InterviewSessionIds is { Count: > 0 })
         {
-            sessionsQuery = sessionsQuery.Where(s => request.InterviewSessionIds.Contains(s.Id));
+            sessionsQuery = sessionsQuery.Where(
+                s => request.InterviewSessionIds.Contains(s.Id));
         }
         else
         {
-            // No specific sessions named: ground in the company's most recently completed interviews.
             sessionsQuery = sessionsQuery
                 .Where(s => s.EndedAt != null)
                 .OrderByDescending(s => s.EndedAt)
@@ -92,61 +101,78 @@ public sealed class AIAssistantService : IAIAssistantService
 
         var sessions = await sessionsQuery.ToListAsync(cancellationToken);
 
-        if (sessions.Count == 0)
-        {
-            var noDataMsg = language switch
-            {
-                "az" => "Bu suala cavab vermək üçün hələlik müsahibə məlumatı yoxdur.",
-                "ru" => "На данный момент нет данных о собеседованиях для ответа на этот вопрос.",
-                _    => "I don't have any interview data available yet to answer that."
-            };
-            return new AssistantQueryResponseDto
-            {
-                Answer = noDataMsg,
-                GroundedSessionIds = new List<Guid>(),
-                GeneratedByModel = _settings.ReportModel
-            };
-        }
-
+        // An empty session list is valid.
+        // The AI must still answer greetings and general HR questions.
         var sessionIds = sessions.Select(s => s.Id).ToList();
-        var answers = await _context.InterviewAnswers
-            .AsNoTracking()
-            .Where(a => sessionIds.Contains(a.InterviewSessionId))
-            .OrderBy(a => a.Order)
-            .ToListAsync(cancellationToken);
+
+        var answers = sessionIds.Count > 0
+            ? await _context.InterviewAnswers
+                .AsNoTracking()
+                .Where(a => sessionIds.Contains(a.InterviewSessionId))
+                .OrderBy(a => a.Order)
+                .ToListAsync(cancellationToken)
+            : new List<InterviewAnswer>();
 
         var answerIds = answers.Select(a => a.Id).ToList();
-        var evaluations = await _context.AIAnswerEvaluations
-            .AsNoTracking()
-            .Where(e => answerIds.Contains(e.InterviewAnswerId))
-            .ToListAsync(cancellationToken);
-        var evaluationsByAnswer = evaluations.ToDictionary(e => e.InterviewAnswerId);
-        var answersBySession = answers.GroupBy(a => a.InterviewSessionId).ToDictionary(g => g.Key, g => g.ToList());
 
-        var groundingData = BuildGroundingData(sessions, answersBySession, evaluationsByAnswer);
+        var evaluations = answerIds.Count > 0
+            ? await _context.AIAnswerEvaluations
+                .AsNoTracking()
+                .Where(e => answerIds.Contains(e.InterviewAnswerId))
+                .ToListAsync(cancellationToken)
+            : new List<AIAnswerEvaluation>();
 
-        // Load conversation history for AI memory (if conversationId is provided and belongs to this user)
+        var evaluationsByAnswer = evaluations
+            .ToDictionary(e => e.InterviewAnswerId);
+
+        var answersBySession = answers
+            .GroupBy(a => a.InterviewSessionId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var groundingData = sessions.Count == 0
+            ? "No candidate or interview data is currently available for this company. " +
+              "Answer general HR questions and greetings normally, but do not invent " +
+              "candidate-specific facts, scores, interviews, or hiring outcomes."
+            : BuildGroundingData(
+                sessions,
+                answersBySession,
+                evaluationsByAnswer);
+
+        // Load conversation history only when the conversation belongs to this user.
         List<(string Role, string Content)> conversationHistory = new();
+
         if (request.ConversationId.HasValue)
         {
             var owned = await _context.AIConversations
-                .AnyAsync(c => c.Id == request.ConversationId.Value && c.UserId == authenticatedUserId, cancellationToken);
+                .AnyAsync(
+                    c => c.Id == request.ConversationId.Value &&
+                         c.UserId == authenticatedUserId,
+                    cancellationToken);
+
             if (owned)
             {
                 var previousMessages = await _context.AIConversationMessages
                     .Where(m => m.ConversationId == request.ConversationId.Value)
                     .OrderBy(m => m.CreatedAt)
                     .ToListAsync(cancellationToken);
+
                 conversationHistory = previousMessages
                     .Select(m => (m.Role, m.Content))
                     .ToList();
             }
         }
 
-        var systemPrompt = AIAssistantPromptBuilder.BuildSystem(languageName);
-        var userPrompt = AIAssistantPromptBuilder.BuildUser(request.Question, groundingData, conversationHistory);
+        var systemPrompt =
+            AIAssistantPromptBuilder.BuildSystem(languageName);
+
+        var userPrompt =
+            AIAssistantPromptBuilder.BuildUser(
+                request.Question,
+                groundingData,
+                conversationHistory);
 
         string answerText;
+
         try
         {
             answerText = await _openRouter.CompleteAsync(
@@ -160,25 +186,33 @@ public sealed class AIAssistantService : IAIAssistantService
         }
         catch (SilentInterview.Application.Common.AINotConfiguredException)
         {
-            // Re-throw so the controller can map to a clean 503 with sentinel string.
             throw;
         }
         catch (GroqAuthenticationException ex)
         {
-            // Do not masquerade deterministic data as AI-generated output. The
-            // recruiter should see a concise provider-status error and can retry
-            // once the configured credential/provider is available again.
-            _logger.LogWarning(ex, "AI provider authentication failed for company {CompanyId}.", scopeCompanyId);
+            _logger.LogWarning(
+                ex,
+                "AI provider authentication failed for company {CompanyId}.",
+                scopeCompanyId);
+
             throw;
         }
         catch (GroqException ex)
         {
-            _logger.LogError(ex, "AI assistant OpenRouter call failed for company {CompanyId}.", scopeCompanyId);
+            _logger.LogError(
+                ex,
+                "AI assistant provider call failed for company {CompanyId}.",
+                scopeCompanyId);
+
             throw;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "AI assistant query failed for company {CompanyId}.", scopeCompanyId);
+            _logger.LogError(
+                ex,
+                "AI assistant query failed for company {CompanyId}.",
+                scopeCompanyId);
+
             throw;
         }
 
@@ -227,6 +261,7 @@ public sealed class AIAssistantService : IAIAssistantService
         };
 
         _context.AIConversations.Add(conversation);
+
         await _context.SaveChangesAsync(cancellationToken);
 
         return new AIConversationDto
@@ -248,7 +283,9 @@ public sealed class AIAssistantService : IAIAssistantService
         CancellationToken cancellationToken = default)
     {
         var conversation = await _context.AIConversations
-            .Where(c => c.Id == conversationId && c.UserId == userId)
+            .Where(c =>
+                c.Id == conversationId &&
+                c.UserId == userId)
             .Select(c => new AIConversationDto
             {
                 Id = c.Id,
@@ -270,13 +307,15 @@ public sealed class AIAssistantService : IAIAssistantService
         Guid userId,
         CancellationToken cancellationToken = default)
     {
-        // Verify ownership
         var conversationExists = await _context.AIConversations
-            .AnyAsync(c => c.Id == conversationId && c.UserId == userId, cancellationToken);
-        
+            .AnyAsync(
+                c => c.Id == conversationId && c.UserId == userId,
+                cancellationToken);
+
         if (!conversationExists)
         {
-            throw new UnauthorizedAccessException("Conversation not found or access denied.");
+            throw new UnauthorizedAccessException(
+                "Conversation not found or access denied.");
         }
 
         var messages = await _context.AIConversationMessages
@@ -300,13 +339,15 @@ public sealed class AIAssistantService : IAIAssistantService
         Guid userId,
         CancellationToken cancellationToken = default)
     {
-        // Verify ownership
         var conversation = await _context.AIConversations
-            .FirstOrDefaultAsync(c => c.Id == request.ConversationId && c.UserId == userId, cancellationToken);
-        
+            .FirstOrDefaultAsync(
+                c => c.Id == request.ConversationId && c.UserId == userId,
+                cancellationToken);
+
         if (conversation == null)
         {
-            throw new UnauthorizedAccessException("Conversation not found or access denied.");
+            throw new UnauthorizedAccessException(
+                "Conversation not found or access denied.");
         }
 
         var message = new AIConversationMessage
@@ -317,10 +358,9 @@ public sealed class AIAssistantService : IAIAssistantService
         };
 
         _context.AIConversationMessages.Add(message);
-        
-        // Update conversation timestamp
+
         conversation.UpdatedAt = DateTime.UtcNow;
-        
+
         await _context.SaveChangesAsync(cancellationToken);
 
         return new AIConversationMessageDto
@@ -339,14 +379,18 @@ public sealed class AIAssistantService : IAIAssistantService
         CancellationToken cancellationToken = default)
     {
         var conversation = await _context.AIConversations
-            .FirstOrDefaultAsync(c => c.Id == conversationId && c.UserId == userId, cancellationToken);
-        
+            .FirstOrDefaultAsync(
+                c => c.Id == conversationId && c.UserId == userId,
+                cancellationToken);
+
         if (conversation == null)
         {
-            throw new UnauthorizedAccessException("Conversation not found or access denied.");
+            throw new UnauthorizedAccessException(
+                "Conversation not found or access denied.");
         }
 
         _context.AIConversations.Remove(conversation);
+
         await _context.SaveChangesAsync(cancellationToken);
     }
 
@@ -356,16 +400,19 @@ public sealed class AIAssistantService : IAIAssistantService
         CancellationToken cancellationToken = default)
     {
         var conversation = await _context.AIConversations
-            .FirstOrDefaultAsync(c => c.Id == request.ConversationId && c.UserId == userId, cancellationToken);
-        
+            .FirstOrDefaultAsync(
+                c => c.Id == request.ConversationId && c.UserId == userId,
+                cancellationToken);
+
         if (conversation == null)
         {
-            throw new UnauthorizedAccessException("Conversation not found or access denied.");
+            throw new UnauthorizedAccessException(
+                "Conversation not found or access denied.");
         }
 
         conversation.Title = request.Title;
         conversation.UpdatedAt = DateTime.UtcNow;
-        
+
         await _context.SaveChangesAsync(cancellationToken);
 
         return new AIConversationDto
@@ -388,27 +435,41 @@ public sealed class AIAssistantService : IAIAssistantService
     {
         var sb = new StringBuilder();
 
-        // Limit to 3 most recent sessions to stay within token budget
         foreach (var session in sessions.Take(3))
         {
-            var candidateName = session.JobApplication.Candidate.User?.FullName ?? "Unknown";
-            sb.AppendLine($"[{candidateName} | {session.JobApplication.Job.Title}]");
+            var candidateName =
+                session.JobApplication.Candidate.User?.FullName ?? "Unknown";
+
+            sb.AppendLine(
+                $"[{candidateName} | {session.JobApplication.Job.Title}]");
 
             var report = session.Report;
+
             if (report is not null)
             {
-                // Summary only — do NOT include full AiReportJson (too large)
-                sb.AppendLine($"Score: {report.Score}/100, Grade: {report.Grade}");
+                sb.AppendLine(
+                    $"Score: {report.Score}/100, Grade: {report.Grade}");
             }
 
-            if (answersBySession.TryGetValue(session.Id, out var sessionAnswers))
+            if (answersBySession.TryGetValue(
+                session.Id,
+                out var sessionAnswers))
             {
-                // Include up to 3 answers per session, with truncated text
                 foreach (var answer in sessionAnswers.Take(3))
                 {
-                    var truncatedAnswer = TruncateText(answer.Answer, 80);
+                    var truncatedAnswer =
+                        TruncateText(answer.Answer, 80);
+
                     sb.AppendLine($"Q{answer.Order}: {answer.Question}");
                     sb.AppendLine($"A{answer.Order}: {truncatedAnswer}");
+
+                    if (evaluationsByAnswer.TryGetValue(
+                        answer.Id,
+                        out var evaluation))
+                    {
+                        sb.AppendLine(
+                            $"Evaluation: {evaluation.AiComment}");
+                    }
                 }
             }
 
@@ -418,9 +479,17 @@ public sealed class AIAssistantService : IAIAssistantService
         return sb.ToString();
     }
 
-    private static string TruncateText(string? text, int maxChars)
+    private static string TruncateText(
+        string? text,
+        int maxChars)
     {
-        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-        return text.Length <= maxChars ? text : text[..maxChars] + "…";
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+
+        return text.Length <= maxChars
+            ? text
+            : text[..maxChars] + "…";
     }
 }

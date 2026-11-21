@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Frontend build
+dist/
+**/dist/
+
+# .NET
+bin/
+**/bin/
+obj/
+**/obj/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test / local files
+coverage/
+TestResults/
+# Environment secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Render/local secrets and environment files
+.env.local
+.env.production
+.env.development
+*.pem
+*.key

@@ -1,0 +1,17 @@
+# Build outputs
+**/bin/
+**/obj/
+.vs/
+Logs/
+
+# Repository metadata
+.git/
+.gitignore
+
+# Local configuration and secrets (never bake into the image)
+.env
+.env.*
+
+# Docker/build metadata
+Dockerfile
+README.md

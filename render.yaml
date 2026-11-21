@@ -1,0 +1,93 @@
+# SilentInterview production stack on Render.
+# The database and JWT/admin secrets are provisioned by Render; never commit a production .env.
+services:
+  - type: web
+    name: silentinterview-prod-api-v2
+    runtime: docker
+    plan: 1c-2g
+    region: frankfurt
+    dockerfilePath: ./back-end/Dockerfile
+    dockerContext: ./back-end
+    healthCheckPath: /health/ready
+    autoDeployTrigger: commit
+    disk:
+      name: silentinterview-user-uploads
+      mountPath: /app/wwwroot/uploads
+      sizeGB: 5
+    envVars:
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: ASPNETCORE_URLS
+        value: http://+:8080
+      - key: ASPNETCORE_FORWARDEDHEADERS_ENABLED
+        value: "true"
+      - key: PORT
+        value: "8080"
+      - key: DOTNET_USE_POLLING_FILE_WATCHER
+        value: "1"
+      - key: Jwt__Issuer
+        value: SilentInterview
+      - key: Jwt__Audience
+        value: SilentInterviewUsers
+      - key: Jwt__Key
+        generateValue: true
+      - key: Auth__RefreshCookieSecure
+        value: "true"
+      - key: Auth__RefreshCookieSameSite
+        value: Lax
+      - key: PGHOST
+        fromDatabase:
+          name: silentinterview-prod-db-v2
+          property: host
+      - key: PGPORT
+        fromDatabase:
+          name: silentinterview-prod-db-v2
+          property: port
+      - key: PGDATABASE
+        fromDatabase:
+          name: silentinterview-prod-db-v2
+          property: database
+      - key: PGUSER
+        fromDatabase:
+          name: silentinterview-prod-db-v2
+          property: user
+      - key: PGPASSWORD
+        fromDatabase:
+          name: silentinterview-prod-db-v2
+          property: password
+      - key: FRONTEND_ORIGIN
+        value: https://silentinterview-prod-web-v2.onrender.com
+      - key: Frontend__BaseUrl
+        value: https://silentinterview-prod-web-v2.onrender.com
+      - key: SUPERADMIN_EMAIL
+        sync: false
+      - key: SUPERADMIN_PASSWORD
+        generateValue: true
+
+  - type: web
+    name: silentinterview-prod-web-v2
+    runtime: static
+    rootDir: ./frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: ./dist
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_VERSION
+        value: 22.16.0
+      - key: VITE_API_BASE_URL
+        value: https://silentinterview-prod-api-v2.onrender.com/api/v1
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+databases:
+  # New resource name avoids binding the API to an expired previous Free database.
+  - name: silentinterview-prod-db-v2
+    plan: 0.5c-1g
+    region: frankfurt
+    postgresMajorVersion: "17"
+    databaseName: silentinterview_db
+    user: silentinterview_user
+    diskSizeGB: 15
+    ipAllowList: []
